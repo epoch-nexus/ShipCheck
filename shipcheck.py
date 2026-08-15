@@ -4,6 +4,7 @@ import argparse
 import ast
 import json
 import re
+import subprocess
 import sys
 import time
 import tomllib
@@ -12,7 +13,42 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
+SCHEMA_VERSION = "1"
+
+
+RULE_CATALOG: dict[str, dict[str, str]] = {
+    "SC001": {"severity": "HIGH", "category": "security", "title": "Dynamic code execution", "description": "Detects eval() and exec() calls.", "recommendation": "Avoid dynamic code execution; use safer parsing or explicit dispatch."},
+    "SC002": {"severity": "HIGH", "category": "security", "title": "Shell execution", "description": "Detects command execution through os.system().", "recommendation": "Use subprocess with shell=False and pass command arguments as a sequence."},
+    "SC003": {"severity": "HIGH", "category": "security", "title": "Shell=True subprocess", "description": "Detects subprocess APIs invoked with shell=True.", "recommendation": "Avoid shell=True for untrusted input; pass arguments directly with shell=False."},
+    "SC004": {"severity": "HIGH", "category": "security", "title": "Unsafe pickle deserialization", "description": "Detects pickle.load() and pickle.loads().", "recommendation": "Do not deserialize untrusted pickle data; use a safer data format such as JSON."},
+    "SC005": {"severity": "HIGH", "category": "security", "title": "Insecure temporary file creation", "description": "Detects tempfile.mktemp().", "recommendation": "Use tempfile.NamedTemporaryFile or another secure temporary-file API."},
+    "SC006": {"severity": "MEDIUM", "category": "security", "title": "Weak cryptographic hash", "description": "Detects MD5 and SHA-1 usage.", "recommendation": "Use SHA-256 or a stronger algorithm when the hash is used for security purposes."},
+    "SC007": {"severity": "HIGH", "category": "security", "title": "TLS verification disabled", "description": "Detects HTTP calls using verify=False.", "recommendation": "Keep TLS certificate verification enabled unless there is a documented, controlled reason to disable it."},
+    "SC008": {"severity": "HIGH", "category": "security", "title": "Hardcoded secret", "description": "Detects likely secrets assigned to secret-like variable names.", "recommendation": "Move secrets to environment variables or a dedicated secret manager and keep them out of source control."},
+    "SC009": {"severity": "LOW", "category": "code_health", "title": "Bare exception", "description": "Detects exception handlers that catch every exception.", "recommendation": "Catch specific exception types instead of catching every exception."},
+    "SC010": {"severity": "MEDIUM", "category": "code_health", "title": "Python syntax error", "description": "Detects Python files that cannot be parsed.", "recommendation": "Fix the syntax error so the source can be parsed and analyzed."},
+    "SC011": {"severity": "MEDIUM", "category": "repository", "title": "Unreadable Python source", "description": "A Python source file could not be read as UTF-8.", "recommendation": "Ensure the source file is readable UTF-8 text."},
+    "SC101": {"severity": "HIGH", "category": "repository", "title": "Invalid repository path", "description": "The supplied repository path does not exist.", "recommendation": "Provide a valid repository path."},
+    "SC102": {"severity": "HIGH", "category": "repository", "title": "Repository path is not a directory", "description": "The supplied repository path is not a directory.", "recommendation": "Provide a repository directory."},
+    "SC103": {"severity": "MEDIUM", "category": "repository", "title": "Missing README", "description": "The repository has no README file.", "recommendation": "Add a README.md describing the project."},
+    "SC201": {"severity": "MEDIUM", "category": "dependencies", "title": "Dependency manifest parse failure", "description": "A dependency manifest could not be parsed.", "recommendation": "Fix the manifest syntax so dependency analysis can continue."},
+    "SC202": {"severity": "MEDIUM", "category": "dependencies", "title": "Large dependency set", "description": "A supported manifest contains more dependencies than the recommended limit.", "recommendation": "Review whether all declared dependencies are necessary."},
+    "SC203": {"severity": "MEDIUM", "category": "dependencies", "title": "Unpinned dependencies", "description": "Dependencies are not pinned to exact versions.", "recommendation": "Pin dependencies to exact versions where reproducible builds are required."},
+    "SC204": {"severity": "MEDIUM", "category": "dependencies", "title": "Missing lockfile", "description": "A dependency manifest has no corresponding lockfile.", "recommendation": "Generate and commit the appropriate lockfile where reproducibility matters."},
+    "SC301": {"severity": "LOW", "category": "repository", "title": "Git unavailable", "description": "Git-aware analysis could not invoke Git.", "recommendation": "Install Git or run ShipCheck without --diff."},
+}
+CATEGORY_NAMES = ("security", "dependencies", "code_health", "repository")
+SEVERITY_ORDER = {"LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
+
+def category_for_rule(rule_id: str) -> str:
+    return RULE_CATALOG.get(rule_id, {}).get("category", "other")
+
+def _extract_location(message: str) -> tuple[str, int] | None:
+    match = re.match(r"^([^:\n]+):(\d+)", message)
+    if not match:
+        return None
+    return match.group(1), int(match.group(2))
 
 
 @dataclass
@@ -25,6 +61,20 @@ class Finding:
     severity: str
     message: str
     recommendation: str
+    rule_id: str = "SC000"
+    category: str = "other"
+    file: str | None = None
+    line: int | None = None
+    column: int | None = None
+
+    def __post_init__(self) -> None:
+        self.severity = self.severity.upper()
+        if self.category == "other":
+            self.category = category_for_rule(self.rule_id)
+        if self.file is None:
+            location = _extract_location(self.message)
+            if location is not None:
+                self.file, self.line = location
 
 
 @dataclass
@@ -70,6 +120,7 @@ class RepositoryAnalyzer(Analyzer):
                     "HIGH",
                     "Repository path does not exist.",
                     "Provide a valid repository path.",
+                rule_id="SC101",
                 )
             )
             return findings
@@ -80,6 +131,7 @@ class RepositoryAnalyzer(Analyzer):
                     "HIGH",
                     "Repository path is not a directory.",
                     "Provide a repository directory.",
+                rule_id="SC102",
                 )
             )
             return findings
@@ -97,6 +149,7 @@ class RepositoryAnalyzer(Analyzer):
                     "MEDIUM",
                     "Repository does not contain a README file.",
                     "Add a README.md describing the project.",
+                rule_id="SC103",
                 )
             )
 
@@ -167,6 +220,7 @@ class DependencyAnalyzer(Analyzer):
                         "MEDIUM",
                         f"Could not parse dependency manifest {filename}: {exc}",
                         f"Fix the syntax of {filename} so dependency analysis can continue.",
+                    rule_id="SC201",
                     )
                 )
                 continue
@@ -183,6 +237,7 @@ class DependencyAnalyzer(Analyzer):
                             f"{self.MAX_DEPENDENCIES}."
                         ),
                         "Review whether all declared dependencies are necessary.",
+                    rule_id="SC202",
                     )
                 )
 
@@ -194,6 +249,7 @@ class DependencyAnalyzer(Analyzer):
                         "MEDIUM",
                         f"{filename} contains unpinned dependencies: {displayed}.",
                         "Pin dependencies to exact versions where reproducible builds are required.",
+                    rule_id="SC203",
                     )
                 )
 
@@ -205,6 +261,7 @@ class DependencyAnalyzer(Analyzer):
                         "MEDIUM",
                         f"{filename} does not have a corresponding lockfile.",
                         self._lockfile_recommendation(filename),
+                        rule_id="SC204",
                     )
                 )
 
@@ -740,6 +797,7 @@ class StaticAnalyzer(Analyzer):
                         f"{self._display_path(root, path)}: {exc}"
                     ),
                     "Ensure the source file is readable UTF-8 text.",
+                rule_id="SC011",
                 )
             )
             return findings
@@ -760,6 +818,7 @@ class StaticAnalyzer(Analyzer):
                         "contains a Python syntax error."
                     ),
                     "Fix the syntax error so the source can be parsed and analyzed.",
+                rule_id="SC010",
                 )
             )
             return findings
@@ -811,6 +870,7 @@ class StaticAnalyzer(Analyzer):
                     "LOW",
                     f"{location} uses a bare except clause.",
                     "Catch specific exception types instead of catching every exception.",
+                rule_id="SC009",
                 )
 
         if isinstance(node, ast.Assign):
@@ -848,6 +908,7 @@ class StaticAnalyzer(Analyzer):
                 "HIGH",
                 f"{location} uses {function_name}(), which executes dynamically supplied code.",
                 "Avoid dynamic code execution; use safer parsing or explicit dispatch.",
+            rule_id="SC001",
             )
 
         if function_name == "os.system":
@@ -855,6 +916,7 @@ class StaticAnalyzer(Analyzer):
                 "HIGH",
                 f"{location} uses os.system(), which executes a command through the system shell.",
                 "Use subprocess with shell=False and pass command arguments as a sequence.",
+            rule_id="SC002",
             )
 
         if function_name in {
@@ -872,6 +934,7 @@ class StaticAnalyzer(Analyzer):
                     "HIGH",
                     f"{location} invokes {function_name}() with shell=True.",
                     "Avoid shell=True for untrusted input; pass arguments directly with shell=False.",
+                rule_id="SC003",
                 )
 
         if function_name in {
@@ -882,6 +945,7 @@ class StaticAnalyzer(Analyzer):
                 "HIGH",
                 f"{location} uses {function_name}(), which can execute code when loading untrusted pickle data.",
                 "Do not deserialize untrusted pickle data; use a safer data format such as JSON.",
+            rule_id="SC004",
             )
 
         if function_name == "tempfile.mktemp":
@@ -889,6 +953,7 @@ class StaticAnalyzer(Analyzer):
                 "HIGH",
                 f"{location} uses tempfile.mktemp(), which can introduce a temporary-file race condition.",
                 "Use tempfile.NamedTemporaryFile or another secure temporary-file API.",
+            rule_id="SC005",
             )
 
         if function_name in {
@@ -904,6 +969,7 @@ class StaticAnalyzer(Analyzer):
                 "MEDIUM",
                 f"{location} uses the weak {algorithm.upper()} hash algorithm.",
                 "Use SHA-256 or a stronger algorithm when the hash is used for security purposes.",
+            rule_id="SC006",
             )
 
         return None
@@ -941,6 +1007,7 @@ class StaticAnalyzer(Analyzer):
             "HIGH",
             f"{location} disables TLS certificate verification with verify=False.",
             "Keep TLS certificate verification enabled unless there is a documented, controlled reason to disable it.",
+        rule_id="SC007",
         )
 
     def _check_secret_assignment(
@@ -991,6 +1058,7 @@ class StaticAnalyzer(Analyzer):
                     f"in variable '{target.id}'."
                 ),
                 "Move secrets to environment variables or a dedicated secret manager and keep them out of source control.",
+            rule_id="SC008",
             )
 
         return None
@@ -1040,6 +1108,7 @@ class StaticAnalyzer(Analyzer):
                 f"in variable '{node.target.id}'."
             ),
             "Move secrets to environment variables or a dedicated secret manager and keep them out of source control.",
+        rule_id="SC008",
         )
 
     def _looks_like_placeholder(
@@ -1292,33 +1361,60 @@ def collect_metrics(root: Path) -> ScanMetrics:
     )
 
 
-def severity_counts(
-    findings: list[Finding],
-) -> dict[str, int]:
-    counts = {
-        "HIGH": 0,
-        "MEDIUM": 0,
-        "LOW": 0,
-    }
-
+def severity_counts(findings: list[Finding]) -> dict[str, int]:
+    counts = {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
     for finding in findings:
         severity = finding.severity.upper()
-
-        if severity not in counts:
-            counts[severity] = 0
-
-        counts[severity] += 1
-
+        counts[severity] = counts.get(severity, 0) + 1
     return counts
 
 
-def has_high_severity(
-    findings: list[Finding],
-) -> bool:
-    return any(
-        finding.severity.upper() == "HIGH"
-        for finding in findings
-    )
+def has_high_severity(findings: list[Finding]) -> bool:
+    return any(finding.severity.upper() == "HIGH" for finding in findings)
+
+
+def calculate_score(findings: list[Finding]) -> dict[str, Any]:
+    """Return deterministic overall and category scores.
+
+    Each finding contributes a fixed penalty based on severity. Category
+    scores start at 100 and are independently capped at zero.
+    """
+    penalties = {"LOW": 2, "MEDIUM": 6, "HIGH": 15, "CRITICAL": 25}
+    category_scores = {category: 100 for category in CATEGORY_NAMES}
+
+    for finding in findings:
+        category = finding.category if finding.category in category_scores else "repository"
+        category_scores[category] = max(
+            0,
+            category_scores[category] - penalties.get(finding.severity, 10),
+        )
+
+    overall = round(sum(category_scores.values()) / len(category_scores))
+    if overall >= 90 and not any(f.severity in {"HIGH", "CRITICAL"} for f in findings):
+        verdict = "READY TO SHIP"
+    elif overall >= 70:
+        verdict = "NEEDS ATTENTION"
+    else:
+        verdict = "NOT READY"
+
+    return {
+        "overall": overall,
+        "categories": category_scores,
+        "verdict": verdict,
+    }
+
+
+def _finding_dict(finding: Finding) -> dict[str, Any]:
+    return {
+        "id": finding.rule_id,
+        "severity": finding.severity,
+        "category": finding.category,
+        "file": finding.file,
+        "line": finding.line,
+        "column": finding.column,
+        "message": finding.message,
+        "recommendation": finding.recommendation,
+    }
 
 
 def build_report(
@@ -1327,30 +1423,28 @@ def build_report(
     metrics: ScanMetrics,
     duration_seconds: float,
 ) -> dict[str, Any]:
+    score = calculate_score(findings)
     return {
+        "version": SCHEMA_VERSION,
         "metadata": {
             "tool": "ShipCheck",
             "version": VERSION,
             "project": str(root),
-            "duration_seconds": round(
-                duration_seconds,
-                6,
-            ),
+            "duration_seconds": round(duration_seconds, 6),
         },
+        "repository": {
+            "path": str(root),
+            "name": root.name,
+            "is_git_repository": (root / ".git").exists(),
+        },
+        "score": score,
         "summary": {
             "findings": len(findings),
             "severity_counts": severity_counts(findings),
             "exit_code": 1 if has_high_severity(findings) else 0,
         },
         "metrics": asdict(metrics),
-        "findings": [
-            {
-                "severity": finding.severity,
-                "message": finding.message,
-                "recommendation": finding.recommendation,
-            }
-            for finding in findings
-        ],
+        "findings": [_finding_dict(finding) for finding in findings],
     }
 
 
@@ -1360,52 +1454,62 @@ def format_report(
     metrics: ScanMetrics | None = None,
     duration_seconds: float | None = None,
 ) -> str:
-    lines: list[str] = []
-
     if metrics is None:
         metrics = collect_metrics(root)
-
     if duration_seconds is None:
         duration_seconds = 0.0
 
     counts = severity_counts(findings)
-
-    lines.append(f"ShipCheck {VERSION}")
-    lines.append(f"Project: {root}")
-    lines.append("")
-
-    lines.append("Scan Summary")
-    lines.append("------------")
-    lines.append(f"Files scanned: {metrics.files_discovered}")
-    lines.append(f"Bytes considered: {metrics.bytes_considered}")
-    lines.append(f"Binary files: {metrics.binary_files}")
-    lines.append(f"Python files: {metrics.python_files}")
-    lines.append(f"Python LOC: {metrics.python_loc}")
-    lines.append(f"Functions: {metrics.functions}")
-    lines.append(f"Methods: {metrics.methods}")
-    lines.append(f"Duration: {duration_seconds:.3f}s")
-    lines.append("")
-
-    lines.append("Findings")
-    lines.append("--------")
-    lines.append(f"Total: {len(findings)}")
-    lines.append(f"HIGH: {counts.get('HIGH', 0)}")
-    lines.append(f"MEDIUM: {counts.get('MEDIUM', 0)}")
-    lines.append(f"LOW: {counts.get('LOW', 0)}")
-    lines.append("")
-
+    score = calculate_score(findings)
+    lines = [
+        f"ShipCheck {VERSION}",
+        f"Project: {root}",
+        "",
+        f"SHIP SCORE: {score['overall']}/100",
+        f"Verdict: {score['verdict']}",
+        "",
+        "Category Scores",
+        "---------------",
+        f"Security:       {score['categories']['security']}",
+        f"Dependencies:   {score['categories']['dependencies']}",
+        f"Code Health:    {score['categories']['code_health']}",
+        f"Repository:     {score['categories']['repository']}",
+        "",
+        "Scan Summary",
+        "------------",
+        f"Files scanned: {metrics.files_discovered}",
+        f"Bytes considered: {metrics.bytes_considered}",
+        f"Binary files: {metrics.binary_files}",
+        f"Python files: {metrics.python_files}",
+        f"Python LOC: {metrics.python_loc}",
+        f"Functions: {metrics.functions}",
+        f"Methods: {metrics.methods}",
+        f"Duration: {duration_seconds:.3f}s",
+        "",
+        "Findings",
+        "--------",
+        f"Total: {len(findings)}",
+        f"HIGH: {counts.get('HIGH', 0)}",
+        f"MEDIUM: {counts.get('MEDIUM', 0)}",
+        f"LOW: {counts.get('LOW', 0)}",
+        "",
+    ]
     if not findings:
         lines.append("No issues found.")
         return "\n".join(lines)
 
     for finding in findings:
-        lines.append(f"[{finding.severity}]")
-        lines.append(finding.message)
-        lines.append(
-            f"Recommendation: {finding.recommendation}"
-        )
-        lines.append("")
-
+        location = ""
+        if finding.file:
+            location = f" {finding.file}"
+            if finding.line is not None:
+                location += f":{finding.line}"
+        lines.extend([
+            f"[{finding.severity}] {finding.rule_id} ({finding.category}){location}",
+            finding.message,
+            f"Recommendation: {finding.recommendation}",
+            "",
+        ])
     return "\n".join(lines).rstrip()
 
 
@@ -1415,105 +1519,226 @@ def format_json_report(
     metrics: ScanMetrics,
     duration_seconds: float,
 ) -> str:
-    report = build_report(
-        root,
-        findings,
-        metrics,
-        duration_seconds,
-    )
-
     return json.dumps(
-        report,
+        build_report(root, findings, metrics, duration_seconds),
         indent=2,
         sort_keys=False,
     )
 
 
+def format_sarif_report(
+    root: Path,
+    findings: list[Finding],
+) -> str:
+    rules = []
+    seen = set()
+    results = []
+    for finding in findings:
+        if finding.rule_id not in seen:
+            info = RULE_CATALOG.get(finding.rule_id, {})
+            rules.append({
+                "id": finding.rule_id,
+                "name": info.get("title", finding.rule_id),
+                "shortDescription": {"text": info.get("description", finding.message)},
+                "help": {"text": finding.recommendation},
+            })
+            seen.add(finding.rule_id)
+
+        result = {
+            "ruleId": finding.rule_id,
+            "level": {
+                "HIGH": "error",
+                "CRITICAL": "error",
+                "MEDIUM": "warning",
+                "LOW": "note",
+            }.get(finding.severity, "warning"),
+            "message": {"text": finding.message},
+        }
+        if finding.file:
+            region = {}
+            if finding.line is not None:
+                region["startLine"] = finding.line
+            if finding.column is not None:
+                region["startColumn"] = finding.column
+            result["locations"] = [{
+                "physicalLocation": {
+                    "artifactLocation": {"uri": finding.file},
+                    **({"region": region} if region else {}),
+                }
+            }]
+        results.append(result)
+
+    document = {
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [{
+            "tool": {
+                "driver": {
+                    "name": "ShipCheck",
+                    "version": VERSION,
+                    "informationUri": "https://github.com/epoch-nexus/ShipCheck",
+                    "rules": rules,
+                }
+            },
+            "results": results,
+        }],
+    }
+    return json.dumps(document, indent=2)
+
+
+def _git_changed_files(root: Path) -> tuple[set[str] | None, str | None]:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "diff", "--name-only", "HEAD", "--"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as exc:
+        return None, str(exc)
+
+    if result.returncode != 0:
+        # Repositories without a usable HEAD can still use the working tree.
+        status = subprocess.run(
+            ["git", "-C", str(root), "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if status.returncode != 0:
+            return None, result.stderr.strip() or "Git command failed."
+        changed = set()
+        for line in status.stdout.splitlines():
+            if len(line) >= 4:
+                changed.add(line[3:].strip().strip('"'))
+        return changed, None
+
+    return {line.strip() for line in result.stdout.splitlines() if line.strip()}, None
+
+
+def filter_findings(
+    findings: list[Finding],
+    severity: str | None = None,
+    changed_files: set[str] | None = None,
+) -> list[Finding]:
+    result = findings
+    if severity:
+        minimum = SEVERITY_ORDER[severity.upper()]
+        result = [
+            finding for finding in result
+            if SEVERITY_ORDER.get(finding.severity, 0) >= minimum
+        ]
+    if changed_files is not None:
+        result = [
+            finding for finding in result
+            if finding.file is not None and finding.file in changed_files
+        ]
+    return result
+
+
+def threshold_exceeded(findings: list[Finding], threshold: str | None) -> bool:
+    if not threshold:
+        return False
+    minimum = SEVERITY_ORDER[threshold.upper()]
+    return any(SEVERITY_ORDER.get(f.severity, 0) >= minimum for f in findings)
+
+
 def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="shipcheck",
-        description=(
-            "Zero-dependency repository preflight auditing CLI."
-        ),
+        description="Zero-dependency repository health, security and dependency analysis.",
     )
-
+    parser.add_argument("repository", type=Path, help="Path to the repository to audit.")
     parser.add_argument(
-        "repository",
-        nargs="?",
-        type=Path,
-        help="Path to the repository to audit.",
+        "--format",
+        choices=("text", "json", "sarif"),
+        default="text",
+        help="Output format (default: text).",
     )
-
     parser.add_argument(
         "--json",
         action="store_true",
         dest="json_output",
-        help="Output the complete report as JSON.",
+        help="Compatibility alias for --format json.",
     )
-
     parser.add_argument(
-        "--version",
-        action="version",
-        version=f"ShipCheck {VERSION}",
+        "--severity",
+        choices=("low", "medium", "high"),
+        help="Only report findings at or above this severity.",
     )
-
+    parser.add_argument(
+        "--fail-on",
+        choices=("low", "medium", "high"),
+        help="Exit with code 1 when a finding reaches this severity.",
+    )
+    parser.add_argument("--quiet", action="store_true", help="Suppress normal report output.")
+    parser.add_argument("--summary", action="store_true", help="Show only the score and finding summary.")
+    parser.add_argument("--diff", action="store_true", help="Analyze findings in changed Git files.")
+    parser.add_argument("--version", action="version", version=f"ShipCheck {VERSION}")
     return parser
+
+
+def format_summary(findings: list[Finding]) -> str:
+    score = calculate_score(findings)
+    counts = severity_counts(findings)
+    return (
+        f"SHIP SCORE: {score['overall']}/100\n"
+        f"VERDICT: {score['verdict']}\n"
+        f"Findings: {len(findings)} | "
+        f"HIGH: {counts.get('HIGH', 0)} | "
+        f"MEDIUM: {counts.get('MEDIUM', 0)} | "
+        f"LOW: {counts.get('LOW', 0)}"
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = create_parser()
-
     args = parser.parse_args(argv)
 
-    if args.repository is None:
-        parser.error(
-            "the following arguments are required: repository"
-        )
-
     root = args.repository.expanduser()
-
-    context = AnalysisContext(
-        root=root
-    )
+    if not root.exists():
+        print(f"ShipCheck: repository does not exist: {root}", file=sys.stderr)
+        return 2
+    if not root.is_dir():
+        print(f"ShipCheck: repository is not a directory: {root}", file=sys.stderr)
+        return 2
 
     start = time.perf_counter()
+    findings = AnalyzerRunner(
+        [RepositoryAnalyzer(), DependencyAnalyzer(), StaticAnalyzer()]
+    ).run(AnalysisContext(root=root))
 
-    runner = AnalyzerRunner(
-        analyzers=[
-            RepositoryAnalyzer(),
-            DependencyAnalyzer(),
-            StaticAnalyzer(),
-        ]
-    )
+    if args.diff:
+        changed, error = _git_changed_files(root)
+        if error is not None:
+            finding = Finding(
+                "LOW",
+                f"Git diff mode unavailable: {error}",
+                "Install Git or run ShipCheck without --diff.",
+                rule_id="SC301",
+            )
+            findings.append(finding)
+        else:
+            findings = filter_findings(findings, changed_files=changed)
 
-    findings = runner.run(
-        context
-    )
-
+    findings = filter_findings(findings, severity=args.severity)
     metrics = collect_metrics(root)
+    duration = time.perf_counter() - start
 
-    duration_seconds = time.perf_counter() - start
+    output_format = "json" if args.json_output else args.format
+    if not args.quiet:
+        if args.summary:
+            print(format_summary(findings))
+        elif output_format == "json":
+            print(format_json_report(root, findings, metrics, duration))
+        elif output_format == "sarif":
+            print(format_sarif_report(root, findings))
+        else:
+            print(format_report(root, findings, metrics, duration))
 
-    if args.json_output:
-        print(
-            format_json_report(
-                root,
-                findings,
-                metrics,
-                duration_seconds,
-            )
-        )
-    else:
-        print(
-            format_report(
-                root,
-                findings,
-                metrics,
-                duration_seconds,
-            )
-        )
-
-    return 1 if has_high_severity(findings) else 0
+    return 1 if threshold_exceeded(findings, args.fail_on) or (
+        args.fail_on is None and has_high_severity(findings)
+    ) else 0
 
 
 if __name__ == "__main__":

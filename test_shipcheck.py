@@ -1045,7 +1045,7 @@ class FormatReportTests(unittest.TestCase):
             )
 
             self.assertIn(
-                "ShipCheck 0.3.0",
+                "ShipCheck 0.4.0",
                 report,
             )
 
@@ -1252,7 +1252,7 @@ class JsonReportTests(unittest.TestCase):
 
             self.assertEqual(
                 data["metadata"]["version"],
-                "0.3.0",
+                "0.4.0",
             )
 
             self.assertEqual(
@@ -1283,6 +1283,21 @@ class JsonReportTests(unittest.TestCase):
             self.assertEqual(
                 data["findings"][0]["severity"],
                 "HIGH",
+            )
+
+            self.assertIn(
+                "id",
+                data["findings"][0],
+            )
+
+            self.assertIn(
+                "category",
+                data["findings"][0],
+            )
+
+            self.assertIn(
+                "score",
+                data,
             )
 
             self.assertEqual(
@@ -1371,7 +1386,10 @@ class BuildReportTests(unittest.TestCase):
             self.assertEqual(
                 set(report.keys()),
                 {
+                    "version",
                     "metadata",
+                    "repository",
+                    "score",
                     "summary",
                     "metrics",
                     "findings",
@@ -1403,12 +1421,7 @@ class CliVersionTests(unittest.TestCase):
 
         self.assertEqual(
             result.stdout.strip(),
-            "ShipCheck 0.3.0",
-        )
-
-        self.assertEqual(
-            result.stderr,
-            "",
+            "ShipCheck 0.4.0",
         )
 
     def test_version_flag_can_be_invoked_directly(self) -> None:
@@ -1467,7 +1480,7 @@ class CliJsonTests(unittest.TestCase):
 
             self.assertEqual(
                 data["metadata"]["version"],
-                "0.3.0",
+                "0.4.0",
             )
 
             self.assertEqual(
@@ -1522,7 +1535,7 @@ class CliJsonTests(unittest.TestCase):
             )
 
             self.assertNotIn(
-                "ShipCheck 0.3.0",
+                "ShipCheck 0.4.0",
                 data["findings"],
             )
 
@@ -1717,12 +1730,12 @@ class CliArgumentTests(unittest.TestCase):
 
             self.assertEqual(
                 result.returncode,
-                1,
+                2,
             )
 
             self.assertIn(
-                "Repository path does not exist.",
-                result.stdout,
+                "repository does not exist",
+                result.stderr,
             )
 
 

@@ -1,12 +1,10 @@
 import json
-import io
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
-from contextlib import redirect_stdout
 
 from shipcheck import (
     AnalysisContext,
@@ -17,7 +15,6 @@ from shipcheck import (
     ScanMetrics,
     StaticAnalyzer,
     build_report,
-    collect_metrics,
     format_json_report,
     format_report,
     main,
@@ -823,44 +820,6 @@ api_key = os.environ["API_KEY"]
             [],
         )
 
-    def test_f_string_secret_is_reported(self) -> None:
-        findings = self.run_analyzer({
-            "app.py": 'API_KEY = f"real-secret-value"\n',
-        })
-        self.assertTrue(any(f.rule_id == "SC008" for f in findings))
-
-    def test_dict_secret_is_reported(self) -> None:
-        findings = self.run_analyzer({
-            "app.py": 'CONFIG = {"api_key": "literal-secret-value"}\n',
-        })
-        self.assertTrue(any(f.rule_id == "SC008" for f in findings))
-
-    def test_environment_default_secret_is_reported(self) -> None:
-        findings = self.run_analyzer({
-            "app.py": 'value = os.environ.get("API_KEY", "literal-secret-value")\n',
-        })
-        self.assertTrue(any(f.rule_id == "SC008" for f in findings))
-
-    def test_secret_placeholders_and_environment_values_are_ignored(self) -> None:
-        findings = self.run_analyzer({
-            "app.py": (
-                'API_KEY = "${API_KEY}"\n'
-                'PASSWORD = "your-password"\n'
-                'value = os.environ.get("API_KEY", "your-api-key")\n'
-                'CONFIG = {"api_key": "${API_KEY}"}\n'
-            ),
-        })
-        self.assertFalse(any(f.rule_id == "SC008" for f in findings))
-
-    def test_nested_eval_and_subprocess_find_both_rules(self) -> None:
-        findings = self.run_analyzer({
-            "app.py": 'subprocess.run(eval(command), shell=True)\n',
-        })
-        self.assertEqual(
-            {f.rule_id for f in findings},
-            {"SC001", "SC003"},
-        )
-
     def test_annotated_secret_is_reported(self) -> None:
         findings = self.run_analyzer(
             {
@@ -970,62 +929,6 @@ eval(user_input)
             [],
         )
 
-    def test_gitignore_pattern_forms_and_negation(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            (root / ".gitignore").write_text(
-                "# comment\n*.secret\n/cache/\n**/nested.py\nignored/\n!ignored/keep.py\n/root.py\n",
-                encoding="utf-8",
-            )
-            for relative in [
-                "top.secret",
-                "cache/app.py",
-                "a/b/nested.py",
-                "ignored/bad.py",
-                "ignored/keep.py",
-                "root.py",
-                "nested/root.py",
-            ]:
-                path = root / relative
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text("eval(command)\n", encoding="utf-8")
-
-            findings = StaticAnalyzer().analyze(AnalysisContext(root=root))
-            scanned = {f.file for f in findings if f.rule_id == "SC001"}
-            self.assertIn("ignored/keep.py", scanned)
-            self.assertIn("nested/root.py", scanned)
-            self.assertNotIn("cache/app.py", scanned)
-            self.assertNotIn("a/b/nested.py", scanned)
-            self.assertNotIn("ignored/bad.py", scanned)
-            self.assertNotIn("root.py", scanned)
-
-    def test_gitignore_excludes_python_scan_and_metrics(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            (root / ".gitignore").write_text(
-                "ignored_dir/\nignored.py\n",
-                encoding="utf-8",
-            )
-            (root / "kept.py").write_text(
-                "API_KEY = 'real-secret-value'\n",
-                encoding="utf-8",
-            )
-            (root / "ignored.py").write_text(
-                "API_KEY = 'real-secret-value'\n",
-                encoding="utf-8",
-            )
-            (root / "ignored_dir").mkdir()
-            (root / "ignored_dir" / "nested.py").write_text(
-                "API_KEY = 'real-secret-value'\n",
-                encoding="utf-8",
-            )
-
-            findings = StaticAnalyzer().analyze(AnalysisContext(root=root))
-            metrics = collect_metrics(root)
-
-            self.assertEqual([f.file for f in findings if f.rule_id == "SC008"], ["kept.py"])
-            self.assertEqual(metrics.python_files, 1)
-
     def test_excluded_directories_are_ignored(self) -> None:
         findings = self.run_analyzer(
             {
@@ -1042,37 +945,6 @@ eval(user_input)
             findings,
             [],
         )
-
-    def test_symlink_cycle_terminates(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            (root / "app.py").write_text("x = 1\n", encoding="utf-8")
-            try:
-                (root / "loop").symlink_to(root, target_is_directory=True)
-            except OSError as exc:
-                self.skipTest(f"symlinks unavailable: {exc}")
-
-            findings = StaticAnalyzer().analyze(AnalysisContext(root=root))
-            self.assertFalse(any(f.rule_id == "SC302" for f in findings))
-
-    def test_byte_limit_reports_truncated_scan(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            (root / "app.py").write_text("eval(command)\n", encoding="utf-8")
-            findings = StaticAnalyzer().analyze(
-                AnalysisContext(root=root, max_bytes=1)
-            )
-            self.assertTrue(any(f.rule_id == "SC302" for f in findings))
-
-    def test_file_limit_reports_truncated_scan(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            (root / "one.py").write_text("x = 1\n", encoding="utf-8")
-            (root / "two.py").write_text("x = 2\n", encoding="utf-8")
-            findings = StaticAnalyzer().analyze(
-                AnalysisContext(root=root, max_files=1)
-            )
-            self.assertTrue(any(f.rule_id == "SC302" for f in findings))
 
     def test_clean_python_file_has_no_findings(self) -> None:
         findings = self.run_analyzer(
@@ -1818,78 +1690,6 @@ class CliExitCodeTests(unittest.TestCase):
             )
 
 
-class ConfigTests(unittest.TestCase):
-    def _run_json(self, root: Path) -> tuple[int, dict]:
-        output = io.StringIO()
-        with redirect_stdout(output):
-            code = main([str(root), "--format", "json"])
-        return code, json.loads(output.getvalue())
-
-    def _base_repo(self, root: Path) -> None:
-        (root / "README.md").write_text("# Test\n", encoding="utf-8")
-
-    def test_config_driven_exclusion(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            self._base_repo(root)
-            (root / ".shipcheck.toml").write_text(
-                '[shipcheck]\nexclude = ["generated/"]\n',
-                encoding="utf-8",
-            )
-            (root / "generated").mkdir()
-            (root / "generated" / "app.py").write_text(
-                "eval(command)\n", encoding="utf-8"
-            )
-            code, report = self._run_json(root)
-            self.assertEqual(code, 0)
-            self.assertFalse(any(f["id"] == "SC001" for f in report["findings"]))
-
-    def test_config_driven_severity_override(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            self._base_repo(root)
-            (root / ".shipcheck.toml").write_text(
-                '[rules]\nSC001 = "LOW"\n',
-                encoding="utf-8",
-            )
-            (root / "app.py").write_text("eval(command)\n", encoding="utf-8")
-            code, report = self._run_json(root)
-            finding = next(f for f in report["findings"] if f["id"] == "SC001")
-            self.assertEqual(code, 0)
-            self.assertEqual(finding["severity"], "LOW")
-
-    def test_config_sets_sarif_information_uri(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            self._base_repo(root)
-            (root / ".shipcheck.toml").write_text(
-                '[shipcheck]\ninformation_uri = "https://example.com/shipcheck"\n',
-                encoding="utf-8",
-            )
-            (root / "app.py").write_text("eval(command)\n", encoding="utf-8")
-            output = io.StringIO()
-            with redirect_stdout(output):
-                main([str(root), "--format", "sarif"])
-            report = json.loads(output.getvalue())
-            self.assertEqual(
-                report["runs"][0]["tool"]["driver"]["informationUri"],
-                "https://example.com/shipcheck",
-            )
-
-    def test_baseline_suppresses_finding_fingerprint(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            self._base_repo(root)
-            (root / ".shipcheck.toml").write_text(
-                '[shipcheck]\nbaseline = ["SC001|app.py|1"]\n',
-                encoding="utf-8",
-            )
-            (root / "app.py").write_text("eval(command)\n", encoding="utf-8")
-            code, report = self._run_json(root)
-            self.assertEqual(code, 0)
-            self.assertFalse(any(f["id"] == "SC001" for f in report["findings"]))
-
-
 class CliArgumentTests(unittest.TestCase):
     def test_missing_repository_is_rejected(self) -> None:
         result = subprocess.run(
@@ -1910,18 +1710,6 @@ class CliArgumentTests(unittest.TestCase):
             "repository",
             result.stderr,
         )
-
-    def test_max_files_cli_limit_reports_truncation(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            (root / "README.md").write_text("# Test\n", encoding="utf-8")
-            (root / "app.py").write_text("eval(command)\n", encoding="utf-8")
-            output = io.StringIO()
-            with redirect_stdout(output):
-                code = main([str(root), "--format", "json", "--max-files", "1"])
-            report = json.loads(output.getvalue())
-            self.assertEqual(code, 0)
-            self.assertTrue(any(f["id"] == "SC302" for f in report["findings"]))
 
     def test_nonexistent_repository_returns_high_exit_code(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

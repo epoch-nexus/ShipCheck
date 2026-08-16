@@ -1,7 +1,5 @@
 # ShipCheck 0.4.0 Upgrade Report
 
-This upgrade keeps the zero-runtime-dependency architecture and extends traversal safety, secret detection, configuration, reporting, and scan performance.
-
 ## Files changed/added
 
 - `shipcheck.py`
@@ -33,22 +31,10 @@ This upgrade keeps the zero-runtime-dependency architecture and extends traversa
 - `.gitignore`
   - Preserved the existing runtime/build exclusions
 
-## Changes in this upgrade
-
-- Gitignore-aware Python traversal and Python metrics, including `*`, `**`, `/`, trailing `/`, comments, blank lines, and `!` negation.
-- Symlink-cycle protection with inode tracking.
-- Configurable `--max-files` and `--max-bytes` safety limits with `SC302` truncation findings.
-- SC008 detection expanded to f-strings, secret-like dictionary entries, and `os.environ.get()` literal defaults while retaining placeholder and minimum-length filtering.
-- AST node checking now collects all applicable findings instead of returning after the first match.
-- `.shipcheck.toml` support for severity overrides, exclusions, baselines, and SARIF metadata.
-- SARIF no longer embeds a project-specific repository URL by default.
-- Static Python file analysis uses a bounded `ThreadPoolExecutor` and findings are sorted deterministically by location and rule.
-
 ## Verification
 
-- Full test suite: **84 tests passed**
+- Full test suite: **68 tests passed**
 - Runtime import verification: **PASS**
-- Local smoke benchmark: 12 files in about 0.67 seconds (~18 files/sec) on Python 3.13.5; environment-specific, not a performance guarantee
 - ShipCheck self-scan: **0 findings, 100/100**
 - JSON output: verified
 - SARIF output: verified

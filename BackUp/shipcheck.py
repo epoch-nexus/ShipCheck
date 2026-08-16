@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor
 import ast
 import json
-import os
 import re
 import subprocess
 import sys
@@ -39,7 +37,6 @@ RULE_CATALOG: dict[str, dict[str, str]] = {
     "SC203": {"severity": "MEDIUM", "category": "dependencies", "title": "Unpinned dependencies", "description": "Dependencies are not pinned to exact versions.", "recommendation": "Pin dependencies to exact versions where reproducible builds are required."},
     "SC204": {"severity": "MEDIUM", "category": "dependencies", "title": "Missing lockfile", "description": "A dependency manifest has no corresponding lockfile.", "recommendation": "Generate and commit the appropriate lockfile where reproducibility matters."},
     "SC301": {"severity": "LOW", "category": "repository", "title": "Git unavailable", "description": "Git-aware analysis could not invoke Git.", "recommendation": "Install Git or run ShipCheck without --diff."},
-    "SC302": {"severity": "MEDIUM", "category": "repository", "title": "Scan truncated", "description": "Repository traversal reached a configured safety limit.", "recommendation": "Increase --max-files or --max-bytes if a complete scan is required."},
 }
 CATEGORY_NAMES = ("security", "dependencies", "code_health", "repository")
 SEVERITY_ORDER = {"LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
@@ -54,119 +51,9 @@ def _extract_location(message: str) -> tuple[str, int] | None:
     return match.group(1), int(match.group(2))
 
 
-class GitIgnoreMatcher:
-    """Minimal .gitignore matcher for repository-local traversal."""
-
-    def __init__(self, root: Path, extra_exclusions: tuple[str, ...] = ()) -> None:
-        self.root = root
-        self.patterns: list[tuple[re.Pattern[str], bool, bool]] = []
-        self._load(root / ".gitignore")
-        for pattern in extra_exclusions:
-            self._add_pattern(pattern)
-
-    def _load(self, path: Path) -> None:
-        try:
-            lines = path.read_text(encoding="utf-8").splitlines()
-        except (OSError, UnicodeDecodeError):
-            return
-        for line in lines:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            self._add_pattern(line)
-
-    def _add_pattern(self, pattern: str) -> None:
-        negated = pattern.startswith("!")
-        if negated:
-            pattern = pattern[1:]
-        if not pattern:
-            return
-        directory_only = pattern.endswith("/")
-        pattern = pattern.rstrip("/")
-        anchored = pattern.startswith("/")
-        pattern = pattern.lstrip("/")
-        if not pattern:
-            return
-        regex = self._glob_regex(pattern, anchored)
-        self.patterns.append((re.compile(regex), negated, directory_only))
-
-    @staticmethod
-    def _glob_regex(pattern: str, anchored: bool) -> str:
-        i = 0
-        parts: list[str] = []
-        while i < len(pattern):
-            if pattern[i:i + 3] == "**/":
-                parts.append("(?:.*/)?")
-                i += 3
-                continue
-            if pattern[i:i + 3] == "/**":
-                parts.append("(?:/.*)?")
-                i += 3
-                continue
-            char = pattern[i]
-            if char == "*":
-                if i + 1 < len(pattern) and pattern[i + 1] == "*":
-                    parts.append(".*")
-                    i += 2
-                else:
-                    parts.append("[^/]*")
-                    i += 1
-            elif char == "?":
-                parts.append("[^/]")
-                i += 1
-            else:
-                parts.append(re.escape(char))
-                i += 1
-        body = "".join(parts)
-        if "/" not in pattern:
-            if anchored:
-                return rf"^{body}$"
-            return rf"^(?:.*/)?{body}$"
-        if anchored:
-            return rf"^{body}$"
-        return rf"^(?:.*/)?{body}$"
-
-    def is_ignored(self, relative_path: Path, is_dir: bool = False) -> bool:
-        normalized = relative_path.as_posix().lstrip("./")
-        ignored = False
-        for regex, negated, directory_only in self.patterns:
-            if directory_only and not is_dir:
-                continue
-            if regex.match(normalized):
-                ignored = not negated
-        return ignored
-
-    def is_path_ignored(self, relative_path: Path) -> bool:
-        parts = relative_path.parts
-        ignored_parent = any(
-            self.is_ignored(Path(*parts[:index]), is_dir=True)
-            for index in range(1, len(parts))
-        )
-        normalized = relative_path.as_posix().lstrip("./")
-        self_state: bool | None = None
-        for regex, negated, directory_only in self.patterns:
-            if directory_only or not regex.match(normalized):
-                continue
-            self_state = not negated
-        if self_state is not None:
-            return self_state
-        return ignored_parent
-
-
 @dataclass
 class AnalysisContext:
     root: Path
-    config: "ShipCheckConfig | None" = None
-    max_files: int = 10000
-    max_bytes: int = 100 * 1024 * 1024
-
-
-@dataclass
-class ShipCheckConfig:
-    severity_overrides: dict[str, str]
-    exclusions: tuple[str, ...]
-    baseline: set[tuple[str, str, int]]
-    information_uri: str | None = None
 
 
 @dataclass
@@ -786,73 +673,6 @@ class DependencyAnalyzer(Analyzer):
         return recommendations[filename]
 
 
-def _iter_repository_files(
-    root: Path,
-    matcher: GitIgnoreMatcher,
-    excluded_directories: set[str],
-    max_files: int,
-    max_bytes: int,
-) -> tuple[list[Path], bool]:
-    files: list[Path] = []
-    total_bytes = 0
-    truncated = False
-    stack = [root]
-    visited_dirs: set[tuple[int, int]] = set()
-
-    while stack:
-        directory = stack.pop()
-        try:
-            stat = directory.stat()
-            identity = (stat.st_dev, stat.st_ino)
-        except OSError:
-            continue
-        if identity in visited_dirs:
-            continue
-        visited_dirs.add(identity)
-
-        try:
-            entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
-        except OSError:
-            continue
-
-        child_dirs: list[Path] = []
-        for entry in entries:
-            path = Path(entry.path)
-            try:
-                is_dir = entry.is_dir(follow_symlinks=True)
-                is_file = entry.is_file(follow_symlinks=True)
-            except OSError:
-                continue
-
-            relative = path.relative_to(root)
-            if any(part in excluded_directories for part in relative.parts):
-                continue
-
-            if is_dir:
-                child_dirs.append(path)
-                continue
-            if not is_file or matcher.is_path_ignored(relative):
-                continue
-
-            try:
-                size = entry.stat(follow_symlinks=True).st_size
-            except OSError:
-                continue
-
-            if len(files) >= max_files or total_bytes + size > max_bytes:
-                truncated = True
-                break
-
-            files.append(path)
-            total_bytes += size
-
-        if truncated:
-            break
-        stack.extend(reversed(child_dirs))
-
-    return files, truncated
-
-
 class StaticAnalyzer(Analyzer):
     name = "StaticAnalyzer"
 
@@ -919,55 +739,40 @@ class StaticAnalyzer(Analyzer):
         if not root.exists() or not root.is_dir():
             return findings
 
-        paths, truncated = self._python_files(root, context)
-        with ThreadPoolExecutor(max_workers=min(8, max(1, len(paths)))) as executor:
-            for file_findings in executor.map(
-                lambda path: self._analyze_python_file(root, path),
-                paths,
-            ):
-                findings.extend(file_findings)
-        if truncated:
-            findings.append(
-                Finding(
-                    "MEDIUM",
-                    "Repository scan was truncated after reaching the configured file or byte limit.",
-                    "Increase --max-files or --max-bytes if a complete scan is required.",
-                    rule_id="SC302",
+        for path in self._python_files(root):
+            findings.extend(
+                self._analyze_python_file(
+                    root,
+                    path,
                 )
             )
 
-        return sorted(
-            findings,
-            key=lambda finding: (
-                finding.file or "",
-                finding.line or 0,
-                finding.column or 0,
-                finding.rule_id,
-                finding.message,
-            ),
-        )
+        return findings
 
     def _python_files(
         self,
         root: Path,
-        context: AnalysisContext | None = None,
-    ) -> tuple[list[Path], bool]:
-        config = context.config if context is not None and context.config is not None else ShipCheckConfig({}, (), set())
-        matcher = GitIgnoreMatcher(root, config.exclusions)
-        paths, truncated = _iter_repository_files(
-            root,
-            matcher,
-            self.EXCLUDED_DIRECTORIES,
-            context.max_files if context is not None else 10000,
-            context.max_bytes if context is not None else 100 * 1024 * 1024,
-        )
-        files = [
-            path for path in paths
-            if path.suffix == ".py"
-            and not path.name.startswith("test_")
-            and not path.name.endswith("_test.py")
-        ]
-        return sorted(files), truncated
+    ) -> list[Path]:
+        files: list[Path] = []
+
+        for path in root.rglob("*.py"):
+            relative_parts = path.relative_to(root).parts
+
+            if any(
+                part in self.EXCLUDED_DIRECTORIES
+                for part in relative_parts
+            ):
+                continue
+
+            if path.name.startswith("test_"):
+                continue
+
+            if path.name.endswith("_test.py"):
+                continue
+
+            files.append(path)
+
+        return sorted(files)
 
     def _analyze_python_file(
         self,
@@ -1019,13 +824,14 @@ class StaticAnalyzer(Analyzer):
             return findings
 
         for node in ast.walk(tree):
-            findings.extend(
-                self._check_node(
-                    node,
-                    root,
-                    path,
-                )
+            finding = self._check_node(
+                node,
+                root,
+                path,
             )
+
+            if finding is not None:
+                findings.append(finding)
 
         return findings
 
@@ -1034,40 +840,58 @@ class StaticAnalyzer(Analyzer):
         node: ast.AST,
         root: Path,
         path: Path,
-    ) -> list[Finding]:
-        location = self._location(root, path, node)
-        findings: list[Finding] = []
+    ) -> Finding | None:
+        location = self._location(
+            root,
+            path,
+            node,
+        )
 
         if isinstance(node, ast.Call):
-            dangerous_call = self._check_dangerous_call(node, location)
+            dangerous_call = self._check_dangerous_call(
+                node,
+                location,
+            )
+
             if dangerous_call is not None:
-                findings.append(dangerous_call)
+                return dangerous_call
 
-            verify_finding = self._check_verify_false(node, location)
+            verify_finding = self._check_verify_false(
+                node,
+                location,
+            )
+
             if verify_finding is not None:
-                findings.append(verify_finding)
+                return verify_finding
 
-            findings.extend(self._check_secret_call_default(node, location))
-
-        if isinstance(node, ast.ExceptHandler) and node.type is None:
-            findings.append(
-                Finding(
+        if isinstance(node, ast.ExceptHandler):
+            if node.type is None:
+                return Finding(
                     "LOW",
                     f"{location} uses a bare except clause.",
                     "Catch specific exception types instead of catching every exception.",
-                    rule_id="SC009",
+                rule_id="SC009",
                 )
-            )
 
         if isinstance(node, ast.Assign):
-            findings.extend(self._check_secret_assignment(node, location))
+            secret_finding = self._check_secret_assignment(
+                node,
+                location,
+            )
+
+            if secret_finding is not None:
+                return secret_finding
 
         if isinstance(node, ast.AnnAssign):
-            finding = self._check_annotated_secret_assignment(node, location)
-            if finding is not None:
-                findings.append(finding)
+            secret_finding = self._check_annotated_secret_assignment(
+                node,
+                location,
+            )
 
-        return findings
+            if secret_finding is not None:
+                return secret_finding
+
+        return None
 
     def _check_dangerous_call(
         self,
@@ -1084,7 +908,7 @@ class StaticAnalyzer(Analyzer):
                 "HIGH",
                 f"{location} uses {function_name}(), which executes dynamically supplied code.",
                 "Avoid dynamic code execution; use safer parsing or explicit dispatch.",
-                rule_id="SC001",
+            rule_id="SC001",
             )
 
         if function_name == "os.system":
@@ -1092,7 +916,7 @@ class StaticAnalyzer(Analyzer):
                 "HIGH",
                 f"{location} uses os.system(), which executes a command through the system shell.",
                 "Use subprocess with shell=False and pass command arguments as a sequence.",
-                rule_id="SC002",
+            rule_id="SC002",
             )
 
         if function_name in {
@@ -1102,12 +926,15 @@ class StaticAnalyzer(Analyzer):
             "subprocess.check_output",
             "subprocess.Popen",
         }:
-            if self._keyword_is_true(node, "shell"):
+            if self._keyword_is_true(
+                node,
+                "shell",
+            ):
                 return Finding(
                     "HIGH",
                     f"{location} invokes {function_name}() with shell=True.",
                     "Avoid shell=True for untrusted input; pass arguments directly with shell=False.",
-                    rule_id="SC003",
+                rule_id="SC003",
                 )
 
         if function_name in {
@@ -1118,7 +945,7 @@ class StaticAnalyzer(Analyzer):
                 "HIGH",
                 f"{location} uses {function_name}(), which can execute code when loading untrusted pickle data.",
                 "Do not deserialize untrusted pickle data; use a safer data format such as JSON.",
-                rule_id="SC004",
+            rule_id="SC004",
             )
 
         if function_name == "tempfile.mktemp":
@@ -1126,19 +953,23 @@ class StaticAnalyzer(Analyzer):
                 "HIGH",
                 f"{location} uses tempfile.mktemp(), which can introduce a temporary-file race condition.",
                 "Use tempfile.NamedTemporaryFile or another secure temporary-file API.",
-                rule_id="SC005",
+            rule_id="SC005",
             )
 
         if function_name in {
             "hashlib.md5",
             "hashlib.sha1",
         }:
-            algorithm = function_name.rsplit(".", 1)[1]
+            algorithm = function_name.rsplit(
+                ".",
+                1,
+            )[1]
+
             return Finding(
                 "MEDIUM",
                 f"{location} uses the weak {algorithm.upper()} hash algorithm.",
                 "Use SHA-256 or a stronger algorithm when the hash is used for security purposes.",
-                rule_id="SC006",
+            rule_id="SC006",
             )
 
         return None
@@ -1149,16 +980,24 @@ class StaticAnalyzer(Analyzer):
         location: str,
     ) -> Finding | None:
         function_name = self._call_name(node)
+
         if function_name is None:
             return None
 
-        method_name = function_name.rsplit(".", 1)[-1]
+        method_name = function_name.rsplit(
+            ".",
+            1,
+        )[-1]
+
         if method_name not in self.HTTP_METHODS:
             return None
 
         if not any(
             keyword.arg == "verify"
-            and isinstance(keyword.value, ast.Constant)
+            and isinstance(
+                keyword.value,
+                ast.Constant,
+            )
             and keyword.value.value is False
             for keyword in node.keywords
         ):
@@ -1168,100 +1007,109 @@ class StaticAnalyzer(Analyzer):
             "HIGH",
             f"{location} disables TLS certificate verification with verify=False.",
             "Keep TLS certificate verification enabled unless there is a documented, controlled reason to disable it.",
-            rule_id="SC007",
+        rule_id="SC007",
         )
 
     def _check_secret_assignment(
         self,
         node: ast.Assign,
         location: str,
-    ) -> list[Finding]:
-        findings: list[Finding] = []
+    ) -> Finding | None:
+        value = node.value
+
+        if not isinstance(
+            value,
+            ast.Constant,
+        ):
+            return None
+
+        if not isinstance(
+            value.value,
+            str,
+        ):
+            return None
+
+        secret_value = value.value.strip()
+
         for target in node.targets:
-            if not isinstance(target, ast.Name):
+            if not isinstance(
+                target,
+                ast.Name,
+            ):
                 continue
-            finding = self._secret_finding_for_name(
-                target.id,
-                node.value,
-                location,
+
+            if not self.SECRET_NAME_PATTERN.search(
+                target.id
+            ):
+                continue
+
+            if self._looks_like_placeholder(
+                secret_value
+            ):
+                continue
+
+            if len(secret_value) < 8:
+                continue
+
+            return Finding(
+                "HIGH",
+                (
+                    f"{location} appears to contain a hardcoded secret "
+                    f"in variable '{target.id}'."
+                ),
+                "Move secrets to environment variables or a dedicated secret manager and keep them out of source control.",
+            rule_id="SC008",
             )
-            if finding is not None:
-                findings.append(finding)
-        findings.extend(self._check_secret_dict(node.value, location))
-        return findings
+
+        return None
 
     def _check_annotated_secret_assignment(
         self,
         node: ast.AnnAssign,
         location: str,
     ) -> Finding | None:
-        if not isinstance(node.target, ast.Name):
+        if not isinstance(
+            node.target,
+            ast.Name,
+        ):
             return None
-        return self._secret_finding_for_name(node.target.id, node.value, location)
 
-    def _check_secret_dict(
-        self,
-        value: ast.AST,
-        location: str,
-    ) -> list[Finding]:
-        if not isinstance(value, ast.Dict):
-            return []
-        findings: list[Finding] = []
-        for key, item in zip(value.keys, value.values):
-            if not isinstance(key, ast.Constant) or not isinstance(key.value, str):
-                continue
-            if not self.SECRET_NAME_PATTERN.search(key.value):
-                continue
-            finding = self._secret_finding_for_name(key.value, item, location)
-            if finding is not None:
-                findings.append(finding)
-        return findings
+        if not self.SECRET_NAME_PATTERN.search(
+            node.target.id
+        ):
+            return None
 
-    def _check_secret_call_default(
-        self,
-        node: ast.Call,
-        location: str,
-    ) -> list[Finding]:
-        if self._call_name(node) != "os.environ.get" or len(node.args) < 2:
-            return []
-        key = node.args[0]
-        default = node.args[1]
-        if not isinstance(key, ast.Constant) or not isinstance(key.value, str):
-            return []
-        if not self.SECRET_NAME_PATTERN.search(key.value):
-            return []
-        finding = self._secret_finding_for_name(key.value, default, location)
-        return [finding] if finding is not None else []
+        if not isinstance(
+            node.value,
+            ast.Constant,
+        ):
+            return None
 
-    def _secret_finding_for_name(
-        self,
-        name: str,
-        value: ast.AST | None,
-        location: str,
-    ) -> Finding | None:
-        if not self.SECRET_NAME_PATTERN.search(name) or value is None:
+        if not isinstance(
+            node.value.value,
+            str,
+        ):
             return None
-        secret_value = self._string_candidate(value)
-        if secret_value is None:
+
+        secret_value = node.value.value.strip()
+
+        if self._looks_like_placeholder(
+            secret_value
+        ):
             return None
-        secret_value = secret_value.strip()
-        if self._looks_like_placeholder(secret_value) or len(secret_value) < 8:
+
+        if len(secret_value) < 8:
             return None
+
         return Finding(
             "HIGH",
-            f"{location} appears to contain a hardcoded secret in '{name}'.",
+            (
+                f"{location} appears to contain a hardcoded secret "
+                f"in variable '{node.target.id}'."
+            ),
             "Move secrets to environment variables or a dedicated secret manager and keep them out of source control.",
-            rule_id="SC008",
+        rule_id="SC008",
         )
-
-    def _string_candidate(self, value: ast.AST) -> str | None:
-        if isinstance(value, ast.Constant) and isinstance(value.value, str):
-            return value.value
-        if isinstance(value, ast.JoinedStr):
-            literal_parts = [part.value for part in value.values if isinstance(part, ast.Constant) and isinstance(part.value, str)]
-            if literal_parts:
-                return "".join(literal_parts)
-        return None
 
     def _looks_like_placeholder(
         self,
@@ -1391,170 +1239,117 @@ def _is_binary(data: bytes) -> bool:
 
 def _calculate_python_metrics(
     root: Path,
-    config: ShipCheckConfig | None = None,
-    max_files: int = 10000,
-    max_bytes: int = 100 * 1024 * 1024,
-) -> tuple[int, int, int, bool]:
+) -> tuple[int, int, int]:
     python_files = 0
     python_loc = 0
     functions = 0
     methods = 0
 
-    config = config or ShipCheckConfig({}, (), set())
-    matcher = GitIgnoreMatcher(root, config.exclusions)
-    paths, truncated = _iter_repository_files(
-        root,
-        matcher,
-        StaticAnalyzer.EXCLUDED_DIRECTORIES,
-        max_files,
-        max_bytes,
-    )
+    excluded_directories = StaticAnalyzer.EXCLUDED_DIRECTORIES
 
-    for path in paths:
-        if path.suffix != ".py":
-            continue
-        if path.name.startswith("test_") or path.name.endswith("_test.py"):
+    for path in root.rglob("*.py"):
+        relative_parts = path.relative_to(root).parts
+
+        if any(
+            part in excluded_directories
+            for part in relative_parts
+        ):
             continue
 
-        try:
-            source = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
+        if path.name.startswith("test_"):
+            continue
+
+        if path.name.endswith("_test.py"):
             continue
 
         python_files += 1
+
+        try:
+            source = path.read_text(encoding="utf-8")
+        except (
+            OSError,
+            UnicodeDecodeError,
+        ):
+            continue
+
         python_loc += sum(
             1
             for line in source.splitlines()
-            if line.strip() and not line.lstrip().startswith("#")
+            if line.strip()
+            and not line.lstrip().startswith("#")
         )
 
         try:
-            tree = ast.parse(source, filename=str(path))
+            tree = ast.parse(
+                source,
+                filename=str(path),
+            )
         except SyntaxError:
             continue
 
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 functions += 1
+
                 if node.col_offset > 0:
                     methods += 1
 
-    return python_files, python_loc, functions, methods, truncated
-
-
-def load_config(root: Path) -> ShipCheckConfig:
-    path = root / ".shipcheck.toml"
-    if not path.exists():
-        return ShipCheckConfig({}, (), set())
-
-    data = tomllib.loads(path.read_text(encoding="utf-8"))
-    section = data.get("shipcheck", {})
-    if not isinstance(section, dict):
-        section = {}
-
-    raw_rules = data.get("rules", data.get("severity", {}))
-    if not isinstance(raw_rules, dict):
-        raw_rules = {}
-    severity_overrides = {
-        str(rule_id): str(severity).upper()
-        for rule_id, severity in raw_rules.items()
-        if str(severity).upper() in SEVERITY_ORDER
-    }
-
-    raw_exclusions = section.get("exclude", data.get("exclude", []))
-    if isinstance(raw_exclusions, str):
-        raw_exclusions = [raw_exclusions]
-    exclusions = tuple(str(item) for item in raw_exclusions) if isinstance(raw_exclusions, list) else ()
-
-    raw_baseline = section.get("baseline", data.get("baseline", []))
-    if isinstance(raw_baseline, str):
-        raw_baseline = [raw_baseline]
-    baseline: set[tuple[str, str, int]] = set()
-    if isinstance(raw_baseline, list):
-        for item in raw_baseline:
-            if not isinstance(item, str):
-                continue
-            parts = item.rsplit("|", 2)
-            if len(parts) != 3:
-                parts = item.rsplit(":", 2)
-            if len(parts) != 3:
-                continue
-            rule_id, filename, line = parts
-            try:
-                baseline.add((rule_id, filename, int(line)))
-            except ValueError:
-                continue
-
-    information_uri = section.get("information_uri", data.get("information_uri"))
-    if information_uri is not None:
-        information_uri = str(information_uri)
-
-    return ShipCheckConfig(
-        severity_overrides=severity_overrides,
-        exclusions=exclusions,
-        baseline=baseline,
-        information_uri=information_uri,
+    return (
+        python_files,
+        python_loc,
+        functions,
+        methods,
     )
 
 
-def apply_config(findings: list[Finding], config: ShipCheckConfig) -> list[Finding]:
-    result: list[Finding] = []
-    for finding in findings:
-        if finding.rule_id in config.severity_overrides:
-            finding.severity = config.severity_overrides[finding.rule_id]
-        fingerprint = (finding.rule_id, finding.file or "", finding.line or 0)
-        if fingerprint in config.baseline:
-            continue
-        result.append(finding)
-    return sorted(
-        result,
-        key=lambda finding: (
-            finding.file or "",
-            finding.line or 0,
-            finding.column or 0,
-            finding.rule_id,
-            finding.message,
-        ),
-    )
-
-
-def collect_metrics(
-    root: Path,
-    config: ShipCheckConfig | None = None,
-    max_files: int = 10000,
-    max_bytes: int = 100 * 1024 * 1024,
-) -> ScanMetrics:
+def collect_metrics(root: Path) -> ScanMetrics:
     if not root.exists() or not root.is_dir():
-        return ScanMetrics(0, 0, 0, 0, 0, 0, 0)
+        return ScanMetrics(
+            files_discovered=0,
+            bytes_considered=0,
+            binary_files=0,
+            python_files=0,
+            python_loc=0,
+            functions=0,
+            methods=0,
+        )
 
-    config = config or ShipCheckConfig({}, (), set())
-    matcher = GitIgnoreMatcher(root, config.exclusions)
-    paths, _ = _iter_repository_files(
-        root,
-        matcher,
-        StaticAnalyzer.EXCLUDED_DIRECTORIES,
-        max_files,
-        max_bytes,
-    )
-
-    files_discovered = len(paths)
+    files_discovered = 0
     bytes_considered = 0
     binary_files = 0
-    for path in paths:
+
+    excluded_directories = StaticAnalyzer.EXCLUDED_DIRECTORIES
+
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+
+        relative_parts = path.relative_to(root).parts
+
+        if any(
+            part in excluded_directories
+            for part in relative_parts
+        ):
+            continue
+
         try:
             data = path.read_bytes()
         except OSError:
             continue
+
+        files_discovered += 1
         bytes_considered += len(data)
+
         if _is_binary(data):
             binary_files += 1
 
-    python_files, python_loc, functions, methods, _ = _calculate_python_metrics(
-        root,
-        config,
-        max_files,
-        max_bytes,
-    )
+    (
+        python_files,
+        python_loc,
+        functions,
+        methods,
+    ) = _calculate_python_metrics(root)
+
     return ScanMetrics(
         files_discovered=files_discovered,
         bytes_considered=bytes_considered,
@@ -1734,7 +1529,6 @@ def format_json_report(
 def format_sarif_report(
     root: Path,
     findings: list[Finding],
-    information_uri: str | None = None,
 ) -> str:
     rules = []
     seen = set()
@@ -1782,7 +1576,7 @@ def format_sarif_report(
                 "driver": {
                     "name": "ShipCheck",
                     "version": VERSION,
-                    "informationUri": information_uri or "https://example.invalid/shipcheck",
+                    "informationUri": "https://github.com/epoch-nexus/ShipCheck",
                     "rules": rules,
                 }
             },
@@ -1880,8 +1674,6 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--quiet", action="store_true", help="Suppress normal report output.")
     parser.add_argument("--summary", action="store_true", help="Show only the score and finding summary.")
     parser.add_argument("--diff", action="store_true", help="Analyze findings in changed Git files.")
-    parser.add_argument("--max-files", type=int, help="Maximum files to consider (default: 10000).")
-    parser.add_argument("--max-bytes", type=int, help="Maximum total file bytes to consider (default: 100 MiB).")
     parser.add_argument("--version", action="version", version=f"ShipCheck {VERSION}")
     return parser
 
@@ -1911,23 +1703,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ShipCheck: repository is not a directory: {root}", file=sys.stderr)
         return 2
 
-    try:
-        config = load_config(root)
-    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
-        print(f"ShipCheck: could not parse .shipcheck.toml: {exc}", file=sys.stderr)
-        return 2
-
-    max_files = args.max_files if args.max_files is not None else 10000
-    max_bytes = args.max_bytes if args.max_bytes is not None else 100 * 1024 * 1024
-    if max_files < 1 or max_bytes < 1:
-        print("ShipCheck: scan limits must be positive integers.", file=sys.stderr)
-        return 2
-
     start = time.perf_counter()
     findings = AnalyzerRunner(
         [RepositoryAnalyzer(), DependencyAnalyzer(), StaticAnalyzer()]
-    ).run(AnalysisContext(root=root, config=config, max_files=max_files, max_bytes=max_bytes))
-    findings = apply_config(findings, config)
+    ).run(AnalysisContext(root=root))
 
     if args.diff:
         changed, error = _git_changed_files(root)
@@ -1943,7 +1722,7 @@ def main(argv: list[str] | None = None) -> int:
             findings = filter_findings(findings, changed_files=changed)
 
     findings = filter_findings(findings, severity=args.severity)
-    metrics = collect_metrics(root, config, max_files, max_bytes)
+    metrics = collect_metrics(root)
     duration = time.perf_counter() - start
 
     output_format = "json" if args.json_output else args.format
@@ -1953,7 +1732,7 @@ def main(argv: list[str] | None = None) -> int:
         elif output_format == "json":
             print(format_json_report(root, findings, metrics, duration))
         elif output_format == "sarif":
-            print(format_sarif_report(root, findings, config.information_uri))
+            print(format_sarif_report(root, findings))
         else:
             print(format_report(root, findings, metrics, duration))
 

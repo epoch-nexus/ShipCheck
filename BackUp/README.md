@@ -70,35 +70,6 @@ Git changed-file analysis:
 python3 shipcheck.py . --diff
 ```
 
-Scan safety limits:
-
-```bash
-python3 shipcheck.py . --max-files 10000 --max-bytes 104857600
-```
-
-The defaults are 10,000 files and 100 MiB of file content. If a limit is reached, ShipCheck emits `SC302` and returns the findings collected before truncation instead of continuing an unbounded traversal. Symlinked directories are inode-tracked to prevent cycles.
-
-## Configuration
-
-A repository may contain `.shipcheck.toml`. Configuration is optional and uses Python 3.11+'s standard-library `tomllib`.
-
-```toml
-[shipcheck]
-exclude = ["generated/", "fixtures/**/*.py"]
-baseline = ["SC001|legacy/app.py|12"]
-information_uri = "https://example.com/shipcheck"
-
-[rules]
-SC008 = "MEDIUM"
-```
-
-- `shipcheck.exclude` adds path patterns to the traversal exclusions.
-- `rules.<rule_id>` overrides a rule's severity (`LOW`, `MEDIUM`, `HIGH`, or `CRITICAL`).
-- `shipcheck.baseline` suppresses exact finding fingerprints in `rule_id|file|line` form.
-- `shipcheck.information_uri` controls the SARIF tool `informationUri`. Without it, SARIF uses a generic placeholder URI.
-
-The built-in `.gitignore` rules are also honored for Python scanning and repository metrics. The parser supports comments, blank lines, `*`, `**`, leading `/`, trailing `/`, and `!` negation.
-
 ## Example
 
 ```text
@@ -148,7 +119,7 @@ Current Python AST security rules include:
 | SC005 | `tempfile.mktemp()` | HIGH |
 | SC006 | MD5 / SHA-1 | MEDIUM |
 | SC007 | HTTP `verify=False` | HIGH |
-| SC008 | likely hardcoded secrets in assignments, f-strings, config dictionaries, and `os.environ.get()` defaults | HIGH |
+| SC008 | likely hardcoded secrets | HIGH |
 
 The rules intentionally use lightweight AST analysis. They do not execute analyzed source.
 
@@ -283,8 +254,6 @@ python3 shipcheck.py . --format sarif
 
 The implementation intentionally covers the useful static-analysis subset rather than attempting to model every SARIF feature.
 
-The SARIF `informationUri` is configurable through `.shipcheck.toml`; it defaults to a generic placeholder rather than assuming a project-hosting URL.
-
 ## Git diff mode
 
 `--diff` uses the system Git executable through Python's standard-library `subprocess` module.
@@ -365,16 +334,6 @@ The tests cover:
 - exit codes
 
 The project also includes fixture-style tests created with temporary repositories, so the tests do not require third-party testing frameworks.
-
-### Benchmark note
-
-A simple local benchmark can be reproduced with:
-
-```bash
-/usr/bin/time -p python3 shipcheck.py . --format json > /dev/null
-```
-
-For the 12-file ShipCheck checkout used during this upgrade, one measured CLI run on Python 3.13.5 took about 0.67 seconds, or about **18 files/sec**. This is an environment-specific smoke benchmark, not a performance guarantee.
 
 ## Security considerations
 

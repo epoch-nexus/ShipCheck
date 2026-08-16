@@ -60,20 +60,6 @@ class CompetitionFeatureTests(unittest.TestCase):
             self.assertEqual(report["findings"][0]["file"], "app.py")
             self.assertEqual(report["findings"][0]["line"], 2)
 
-    def test_sarif_information_uri_is_configurable(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            output = format_sarif_report(
-                root,
-                [Finding("HIGH", "app.py:3 issue", "fix", rule_id="SC001")],
-                information_uri="https://example.com/shipcheck",
-            )
-            data = json.loads(output)
-            self.assertEqual(
-                data["runs"][0]["tool"]["driver"]["informationUri"],
-                "https://example.com/shipcheck",
-            )
-
     def test_sarif_is_valid_json_with_results(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
